@@ -1,0 +1,9 @@
+torch
+pandas
+numpy<2.0.0
+pyqlib
+tqdm
+matplotlib
+seaborn
+loguru
+ipykernel

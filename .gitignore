@@ -10,6 +10,7 @@ data/
 
 CLAUDE.md
 
-# 忽略缓存文件
-__pycache__/
-*.py[cod]
+# Mac OS
+.DS_Store
+
+outputs/

@@ -78,8 +78,7 @@ loss = cross_entropy + λ∑(UΣVᵀ)²  # 对权重矩阵的低秩近似施加�
 curl -LsSf https://astral.sh/uv/install.sh | sh
 
 # 2. 进入项目目录并同步环境
-cd AlphaGPT-AShare
-uv sync
+uv sync --locked
 
 # 3. 激活环境
 source .venv/bin/activate  # Linux/Mac

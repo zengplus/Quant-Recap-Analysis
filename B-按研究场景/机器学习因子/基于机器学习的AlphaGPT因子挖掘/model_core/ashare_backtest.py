@@ -7,12 +7,34 @@ import torch
 import pandas as pd
 
 class AShareBacktest:
-    def __init__(self, rebalance_freq="M"):
-        # A股费率配置
-        self.commission = 0.0003 # 万三佣金
-        self.tax = 0.001        # 千一印花税 (仅卖出收取)
-        self.min_cost = 5.0     # 最低消费 5 元 (简化起见，模型训练中通常忽略，仅在实盘考虑)
+    def __init__(
+        self,
+        rebalance_freq="M",
+        topk=10,
+        signal_lag=1,
+        turnover_penalty=0.0,
+        abs_weight=1.0,
+        alpha_weight_bull=1.0,
+        alpha_weight_bear=0.3,
+        market_regime_threshold=0.0,
+        neg_excess_penalty=0.0,
+        neg_port_penalty=0.0,
+        min_excess_weight=0.0,
+    ):
+        self.commission = 0.0003
+        self.tax = 0.001
+        self.min_cost = 5.0
         self.rebalance_freq = rebalance_freq
+        self.topk = int(topk) if topk is not None else 10
+        self.signal_lag = int(signal_lag) if signal_lag is not None else 1
+        self.turnover_penalty = float(turnover_penalty) if turnover_penalty is not None else 0.0
+        self.abs_weight = float(abs_weight) if abs_weight is not None else 1.0
+        self.alpha_weight_bull = float(alpha_weight_bull) if alpha_weight_bull is not None else 1.0
+        self.alpha_weight_bear = float(alpha_weight_bear) if alpha_weight_bear is not None else 0.3
+        self.market_regime_threshold = float(market_regime_threshold) if market_regime_threshold is not None else 0.0
+        self.neg_excess_penalty = float(neg_excess_penalty) if neg_excess_penalty is not None else 0.0
+        self.neg_port_penalty = float(neg_port_penalty) if neg_port_penalty is not None else 0.0
+        self.min_excess_weight = float(min_excess_weight) if min_excess_weight is not None else 0.0
         self._rebalance_cache_key = None
         self._rebalance_idx = None
     
@@ -25,11 +47,9 @@ class AShareBacktest:
         dt = pd.to_datetime(dates)
         month_keys = dt.to_period("M")
         idx = [0]
-        for i in range(len(month_keys) - 1):
-            if month_keys[i] != month_keys[i + 1]:
+        for i in range(1, len(month_keys)):
+            if month_keys[i] != month_keys[i - 1]:
                 idx.append(i)
-        if len(month_keys) > 1:
-            idx.append(len(month_keys) - 1)
         idx = sorted(set(int(i) for i in idx if 0 <= int(i) < len(month_keys)))
         if len(idx) == 0:
             idx = [0]
@@ -55,92 +75,110 @@ class AShareBacktest:
             fitness: 适应度评分 (用于进化)
             avg_ret: 平均收益率
         """
-        # --- 1. 因子预处理 (Cross-Sectional Norm) ---
-        # 使用截面数据归一化，消除 Beta，聚焦 Alpha
-        # FIX: 改为 dim=0 (Assets) 截面归一化，原 dim=1 (Time) 为全局未来函数
-        mean = factors.mean(dim=0, keepdim=True)
-        std = factors.std(dim=0, keepdim=True) + 1e-9
-        factors_norm = (factors - mean) / std
-        
-        # --- 2. 生成信号与持仓 ---
-        # 使用 sigmoid 将标准化后的因子映射到 (0, 1)
-        # 相比硬阈值 >0.7，保留了信号强弱信息，但为了模拟实际交易，
-        # 我们仍需截断或加权。这里采用软截断：
-        # 信号 < 0.5 做空(A股不可做空则为0)，> 0.5 做多
-        # 在 A 股 Long-Only 场景下，我们关注 ranking。
-        # 这里沿用 Sigmoid 但增加缩放因子，使其更平滑
-        signal = torch.sigmoid(factors_norm * 2.0) 
-        
-        if self.rebalance_freq == "M" and dates is not None:
-            rebalance_idx = self._get_rebalance_idx(dates, device=factors.device)
-            position = torch.empty_like(signal)
-            pos_at_rebalance = torch.clamp((signal.index_select(1, rebalance_idx) - 0.6) / 0.4, min=0.0, max=1.0)
-            idx_list = rebalance_idx.tolist()
-            t_len = signal.shape[1]
-            for k, start in enumerate(idx_list):
-                end = idx_list[k + 1] if (k + 1) < len(idx_list) else t_len
-                position[:, start:end] = pos_at_rebalance[:, k].unsqueeze(1)
-        else:
-            position = torch.clamp((signal - 0.6) / 0.4, min=0.0, max=1.0)
-        
-        # --- 3. 计算换手与成本 ---
-        prev_pos = torch.roll(position, 1, dims=1)
-        prev_pos[:, 0] = 0
-        
-        buy_vol = torch.clamp(position - prev_pos, min=0)
-        sell_vol = torch.clamp(prev_pos - position, min=0)
-        
-        cost_buy = buy_vol * self.commission
-        cost_sell = sell_vol * (self.commission + self.tax)
-        total_cost = cost_buy + cost_sell
-        
-        # --- 4. 计算净收益 ---
-        gross_pnl = position * target_ret
-        net_pnl = gross_pnl - total_cost
-        
-        # --- 5. 高级指标计算 (参考 1.py) ---
-        # 5.1 累计收益与年化收益
-        cum_ret = net_pnl.sum(dim=1)
-        
-        # 5.2 Sortino Ratio (比 Sharpe 更优秀)
-        # 仅惩罚下行波动
-        annual_factor = 15.87 # sqrt(252)
-        mu = net_pnl.mean(dim=1)
-        # 下行标准差
-        down_returns = torch.clamp(net_pnl, max=0.0)
-        down_std = torch.sqrt((down_returns ** 2).mean(dim=1)) + 1e-9
-        sortino = (mu / down_std) * annual_factor
-        
-        # 5.3 分段验证 (防止过拟合)
-        # 将时间轴分为 3 段，要求因子在至少 2 段中表现良好
-        seq_len = net_pnl.shape[1]
-        seg_len = seq_len // 3
-        
-        score_penalty = torch.zeros_like(cum_ret)
-        
-        if seq_len > 60:
-            seg1 = net_pnl[:, :seg_len]
-            seg2 = net_pnl[:, seg_len:2*seg_len]
-            seg3 = net_pnl[:, 2*seg_len:]
-            
-            valid_segs = 0
-            # 检查每段的夏普/均值是否为正
-            valid_segs += (seg1.mean(dim=1) > 0).float()
-            valid_segs += (seg2.mean(dim=1) > 0).float()
-            valid_segs += (seg3.mean(dim=1) > 0).float()
-            
-            # 如果有效段数 < 2，给予重罚
-            score_penalty = torch.where(valid_segs < 2, torch.tensor(-50.0, device=factors.device), torch.tensor(0.0, device=factors.device))
+        if factors is None or target_ret is None:
+            return torch.tensor(-1.0), 0.0
+        if factors.dim() != 2 or target_ret.dim() != 2:
+            return torch.tensor(-1.0, device=factors.device), 0.0
+        n = min(int(factors.shape[0]), int(target_ret.shape[0]))
+        t = min(int(factors.shape[1]), int(target_ret.shape[1]))
+        if n <= 1 or t <= 2:
+            return torch.tensor(-1.0, device=factors.device), 0.0
+        x = factors[:n, :t]
+        y = target_ret[:n, :t]
+        x = torch.nan_to_num(x, nan=float("nan"), posinf=float("nan"), neginf=float("nan"))
+        y = torch.nan_to_num(y, nan=0.0, posinf=0.0, neginf=0.0)
 
-        # --- 6. 综合评分 ---
-        # 基础分：Sortino (注重风险调整后收益) + 累计收益
-        score = sortino * 2.0 + cum_ret * 10.0
-        
-        # 加上分段惩罚
-        score = score + score_penalty
-        
-        # 活跃度检查 (避免几乎不交易的僵尸策略)
-        activity = (position > 0.01).float().sum(dim=1)
-        score = torch.where(activity < 10, torch.tensor(-100.0, device=score.device), score)
-        
-        return torch.median(score), cum_ret.mean().item()
+        if self.rebalance_freq == "M" and dates is not None:
+            rebalance_idx = self._get_rebalance_idx(dates[:t], device=factors.device)
+        else:
+            rebalance_idx = torch.arange(0, t, device=factors.device, dtype=torch.long)
+
+        if rebalance_idx is None or rebalance_idx.numel() == 0:
+            return torch.tensor(-1.0, device=factors.device), 0.0
+
+        lag = int(self.signal_lag) if self.signal_lag is not None else 0
+        if lag < 0:
+            lag = 0
+        rebalance_idx = rebalance_idx[rebalance_idx + lag < t]
+        if rebalance_idx.numel() == 0:
+            return torch.tensor(-1.0, device=factors.device), 0.0
+
+        k = int(self.topk) if self.topk is not None else 10
+        if k <= 0:
+            return torch.tensor(-1.0, device=factors.device), 0.0
+        k = int(min(k, n))
+
+        port_parts = []
+        excess_parts = []
+        turnover_parts = []
+        bench_ret = None
+        if raw_data is not None and isinstance(raw_data, dict) and "bench_ret" in raw_data:
+            bench_ret = raw_data.get("bench_ret", None)
+        idx_list = rebalance_idx.tolist()
+        prev_set = None
+        for j, r in enumerate(idx_list):
+            trade_day = int(r)
+            sig_day = int(r - lag) if lag > 0 else int(r)
+            if sig_day < 0:
+                sig_day = 0
+            start = trade_day
+            end = int(idx_list[j + 1]) if (j + 1) < len(idx_list) else int(t)
+            if start >= end:
+                continue
+            f = x[:, sig_day]
+            f = torch.nan_to_num(f, nan=-1e9, posinf=1e9, neginf=-1e9)
+            top_idx = torch.topk(f, k=k, largest=True).indices
+            r_sel = y.index_select(0, top_idx)[:, start:end]
+            port = r_sel.mean(dim=0)
+            port_parts.append(port)
+            if bench_ret is not None and isinstance(bench_ret, torch.Tensor) and bench_ret.numel() >= end:
+                b = bench_ret[start:end].to(device=port.device, dtype=port.dtype)
+                excess_parts.append(port - b)
+            else:
+                base = y[:, start:end].mean(dim=0)
+                excess_parts.append(port - base)
+            cur_set = set(int(i) for i in top_idx.tolist())
+            if prev_set is not None:
+                overlap = len(prev_set.intersection(cur_set))
+                turnover_parts.append(1.0 - float(overlap) / float(k))
+            prev_set = cur_set
+
+        if len(port_parts) == 0:
+            return torch.tensor(-1.0, device=factors.device), 0.0
+
+        port_all = torch.cat(port_parts, dim=0)
+        excess_all = torch.cat(excess_parts, dim=0) if len(excess_parts) else torch.zeros_like(port_all)
+        port_ann = port_all.mean() * 252.0 * 100.0
+        excess_ann = excess_all.mean() * 252.0 * 100.0
+        bench_all = port_all - excess_all
+        bench_ann = bench_all.mean() * 252.0 * 100.0
+        alpha_w = self.alpha_weight_bull if float(bench_ann.detach().cpu().item()) >= float(self.market_regime_threshold) else self.alpha_weight_bear
+        abs_w = float(self.abs_weight)
+        turnover_pen = float(self.turnover_penalty)
+        turnover_avg = float(sum(turnover_parts) / max(1, len(turnover_parts))) if len(turnover_parts) else 0.0
+        turnover_ann = turnover_avg * 12.0
+        neg_excess = torch.relu(-excess_ann)
+        neg_port = torch.relu(-port_ann)
+        if len(excess_parts):
+            seg_excess = torch.stack([(p.mean() * 252.0 * 100.0) for p in excess_parts])
+            seg_excess, _ = torch.sort(seg_excess)
+            m = int(seg_excess.numel())
+            frac = float(getattr(self, "tail_seg_fraction", 0.2))
+            if frac < 0.0:
+                frac = 0.0
+            if frac > 1.0:
+                frac = 1.0
+            tail_n = int(max(1, round(frac * float(m))))
+            tail_excess_ann = seg_excess[:tail_n].mean()
+        else:
+            tail_excess_ann = torch.zeros_like(excess_ann)
+        score = (
+            abs_w * port_ann
+            + float(alpha_w) * excess_ann
+            + float(self.min_excess_weight) * tail_excess_ann
+            - turnover_pen * float(turnover_ann)
+            - float(self.neg_excess_penalty) * neg_excess
+            - float(self.neg_port_penalty) * neg_port
+        )
+        avg_ret = float(port_ann.detach().cpu().item())
+        return score, avg_ret

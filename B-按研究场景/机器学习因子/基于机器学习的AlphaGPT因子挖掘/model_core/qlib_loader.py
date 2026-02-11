@@ -12,6 +12,7 @@ os.environ.setdefault("GYM_DISABLE_WARNINGS", "1")
 from .config import ModelConfig
 from .factors import FeatureEngineer
 import pandas as pd
+import numpy as np
 
 _DEVNULL = None
 
@@ -165,14 +166,16 @@ class QlibDataLoader:
         factor_t = to_tensor('$factor')
         amount_t = to_tensor('$amount')
 
+        close_raw = close_t
+
         price_mode_norm = str(price_mode).lower().strip() if price_mode is not None else "raw"
         factor_safe = torch.where(factor_t > 1e-9, factor_t, torch.ones_like(factor_t))
-        if price_mode_norm in {"raw", "real", "unadjusted"}:
-            open_t = open_t / factor_safe
-            high_t = high_t / factor_safe
-            low_t = low_t / factor_safe
-            close_t = close_t / factor_safe
-        elif price_mode_norm in {"pre_adjusted", "pre", "adjusted", "adj"}:
+        if price_mode_norm in {"pre_adjusted", "pre", "adjusted", "adj"}:
+            open_t = open_t * factor_safe
+            high_t = high_t * factor_safe
+            low_t = low_t * factor_safe
+            close_t = close_t * factor_safe
+        elif price_mode_norm in {"raw", "real", "unadjusted"}:
             pass
 
         # 5. 构建 raw_data_cache，使用标准 key
@@ -204,15 +207,33 @@ class QlibDataLoader:
         # 收益 = (Close_{T+2} * Adj_{T+2}) / (Close_{T+1} * Adj_{T+1}) - 1
         # 即预测明天的持仓在后天的收益
         
-        close_for_return = self.raw_data_cache['close']
+        close_for_return = close_raw
         t1 = torch.roll(close_for_return, -1, dims=1)
-        t2 = torch.roll(close_for_return, -2, dims=1)
-        
-        # Log Return
-        # 处理除零和 NaN 问题
-        ret = torch.log(t2 / (t1 + 1e-9))
+
+        valid = (close_for_return > 1e-6) & (t1 > 1e-6)
+        safe = torch.where(valid, t1 / (close_for_return + 1e-9), torch.ones_like(t1))
+        ret = torch.where(valid, torch.log(safe), torch.zeros_like(t1))
         self.target_ret = torch.nan_to_num(ret, nan=0.0, posinf=0.0, neginf=0.0)
-        self.target_ret[:, -2:] = 0.0 # 最后两天无效
+        self.target_ret[:, -1:] = 0.0 # 最后一天无效
+
+        bench = getattr(ModelConfig, "BENCHMARK", "SH000300")
+        bench_ret = None
+        try:
+            bench_df = self._D.features([bench], ['$close'], start_time=start_time, end_time=end_time)
+            if bench_df.index.names == ['instrument', 'datetime']:
+                bench_close = bench_df['$close'].unstack(level='datetime').iloc[0]
+            else:
+                bench_close = bench_df['$close'].unstack(level='instrument').iloc[:, 0]
+            bench_close.index = pd.to_datetime(bench_close.index)
+            bench_close = bench_close.reindex(pd.to_datetime(self.dates)).ffill().fillna(0.0)
+            bench_ret_s = (bench_close.shift(-1) / (bench_close + 1e-9)).replace([float("inf"), -float("inf")], 1.0)
+            bench_ret_s = np.log(bench_ret_s).fillna(0.0)
+            bench_ret_s.iloc[-1] = 0.0
+            bench_ret = torch.tensor(bench_ret_s.values, dtype=torch.float32, device=ModelConfig.DEVICE)
+        except Exception:
+            bench_ret = None
+        if bench_ret is not None:
+            self.raw_data_cache["bench_ret"] = bench_ret
         
         if verbose:
             print(f"Data Ready. Feature Shape: {self.feat_tensor.shape}")

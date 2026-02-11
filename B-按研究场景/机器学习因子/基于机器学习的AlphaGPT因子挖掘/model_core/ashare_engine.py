@@ -12,13 +12,20 @@ class AShareAlphaEngine:
         self,
         train_loader,
         valid_loader=None,
+        valid_loaders=None,
+        valid_agg="mean",
         use_lord_regularization=True,
         lord_decay_rate=1e-3,
         lord_num_iterations=5,
         token_mode="postfix",
     ):
         self.train_loader = train_loader
-        self.valid_loader = valid_loader
+        if valid_loaders is None:
+            valid_loaders = []
+        if valid_loader is not None:
+            valid_loaders = [valid_loader] + list(valid_loaders)
+        self.valid_loaders = [v for v in valid_loaders if v is not None]
+        self.valid_agg = str(valid_agg).lower().strip() if valid_agg is not None else "mean"
         self.token_mode = token_mode
         self.model = AlphaGPT().to(ModelConfig.DEVICE)
         self.opt = torch.optim.AdamW(self.model.parameters(), lr=1e-3)
@@ -38,7 +45,20 @@ class AShareAlphaEngine:
             self.lord_opt = None
             self.rank_monitor = None
         self.vm = StackVM()
-        self.bt = AShareBacktest(rebalance_freq="M")
+        self.bt = AShareBacktest(
+            rebalance_freq="M",
+            topk=getattr(ModelConfig, "TOPK", 10),
+            signal_lag=getattr(ModelConfig, "SIGNAL_LAG", 1),
+            turnover_penalty=getattr(ModelConfig, "TURNOVER_PENALTY", 0.0),
+            abs_weight=getattr(ModelConfig, "ABS_WEIGHT", 1.0),
+            alpha_weight_bull=getattr(ModelConfig, "ALPHA_WEIGHT_BULL", 1.0),
+            alpha_weight_bear=getattr(ModelConfig, "ALPHA_WEIGHT_BEAR", 0.3),
+            market_regime_threshold=getattr(ModelConfig, "MARKET_REGIME_THRESHOLD", 0.0),
+            neg_excess_penalty=getattr(ModelConfig, "NEG_EXCESS_PENALTY", 0.0),
+            neg_port_penalty=getattr(ModelConfig, "NEG_PORT_PENALTY", 0.0),
+            min_excess_weight=getattr(ModelConfig, "MIN_EXCESS_WEIGHT", 0.0),
+        )
+        self.bt.tail_seg_fraction = float(getattr(ModelConfig, "TAIL_SEG_FRACTION", 0.2))
         self.best_valid_score = -float('inf')
         self.best_formula = None
         self.training_history = {
@@ -75,6 +95,26 @@ class AShareAlphaEngine:
         score, _ = self.bt.evaluate(res, loader.raw_data_cache, loader.target_ret, dates=loader.dates)
         return score.item()
 
+    def evaluate_formula_valid(self, formula, allow_repair=True):
+        if not self.valid_loaders:
+            return -999.0
+        scores = [self.evaluate_formula(formula, v, allow_repair=allow_repair) for v in self.valid_loaders]
+        if not scores:
+            return -999.0
+        if self.valid_agg == "min":
+            return float(min(scores))
+        if self.valid_agg == "mix":
+            w = float(getattr(ModelConfig, "VALID_MIX_MIN_WEIGHT", 0.7))
+            w = 0.0 if w < 0.0 else (1.0 if w > 1.0 else w)
+            mean_s = float(sum(scores) / float(len(scores)))
+            min_s = float(min(scores))
+            return float(w * min_s + (1.0 - w) * mean_s)
+        if self.valid_agg == "median":
+            s = sorted(float(x) for x in scores)
+            m = len(s) // 2
+            return float(s[m]) if (len(s) % 2 == 1) else float((s[m - 1] + s[m]) / 2.0)
+        return float(sum(scores) / float(len(scores)))
+
     def train(self):
         print("🚀 Starting Alpha Mining...")
         pbar = tqdm(range(ModelConfig.TRAIN_STEPS))
@@ -98,15 +138,15 @@ class AShareAlphaEngine:
             batch_best_train_score = -float('inf')
             for i in range(bs):
                 formula = seqs[i].tolist()
-                score = self.evaluate_formula(formula, self.train_loader, allow_repair=False)
+                score = self.evaluate_formula(formula, self.train_loader, allow_repair=True)
                 rewards[i] = score
                 if score > batch_best_train_score:
                     batch_best_train_score = score
                     batch_best_idx = i
             current_valid_score = -999
-            if self.valid_loader and batch_best_idx >= 0:
+            if self.valid_loaders and batch_best_idx >= 0:
                 best_formula_in_batch = seqs[batch_best_idx].tolist()
-                current_valid_score = self.evaluate_formula(best_formula_in_batch, self.valid_loader, allow_repair=True)
+                current_valid_score = self.evaluate_formula_valid(best_formula_in_batch, allow_repair=True)
                 if current_valid_score > self.best_valid_score:
                     self.best_valid_score = current_valid_score
                     self.best_formula = best_formula_in_batch

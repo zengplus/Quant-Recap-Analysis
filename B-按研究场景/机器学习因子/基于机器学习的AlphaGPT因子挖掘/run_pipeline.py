@@ -19,9 +19,11 @@ def train_ashare(
     train_end,
     valid_start,
     valid_end,
+    valid_periods=None,
+    valid_agg="mean",
     instruments='csi300',
     batch_size=512,
-    train_steps=1000,
+    train_steps=500,
     max_formula_len=12,
     use_lord_regularization=True,
     lord_decay_rate=1e-3,
@@ -73,18 +75,27 @@ def train_ashare(
         if loader.raw_data_cache is not None:
             for k, v in loader.raw_data_cache.items():
                 if isinstance(v, torch.Tensor):
-                    loader.raw_data_cache[k] = v[:, idx:]
+                    if v.dim() == 2:
+                        loader.raw_data_cache[k] = v[:, idx:]
+                    elif v.dim() == 1:
+                        loader.raw_data_cache[k] = v[idx:]
     
     slice_loader(train_loader, train_start)
     
-    valid_loader = QlibDataLoader(provider_uri=provider_uri)
-    # 验证集也同样预留缓冲
-    valid_load_start = (pd.to_datetime(valid_start) - pd.Timedelta(days=730)).strftime("%Y-%m-%d")
-    valid_loader.load_data(start_time=valid_load_start, end_time=valid_end, instruments=instruments, verbose=False, price_mode="pre_adjusted")
-    slice_loader(valid_loader, valid_start)
+    valid_loaders = []
+    if valid_periods is None:
+        valid_periods = [(valid_start, valid_end)]
+    for vs, ve in list(valid_periods):
+        vl = QlibDataLoader(provider_uri=provider_uri)
+        valid_load_start = (pd.to_datetime(vs) - pd.Timedelta(days=730)).strftime("%Y-%m-%d")
+        vl.load_data(start_time=valid_load_start, end_time=ve, instruments=instruments, verbose=False, price_mode="pre_adjusted")
+        slice_loader(vl, vs)
+        valid_loaders.append(vl)
     engine = AShareAlphaEngine(
         train_loader,
-        valid_loader,
+        valid_loader=None,
+        valid_loaders=valid_loaders,
+        valid_agg=valid_agg,
         use_lord_regularization=use_lord_regularization,
         lord_decay_rate=lord_decay_rate,
         lord_num_iterations=lord_num_iterations,
@@ -163,6 +174,7 @@ def run_full_pipeline(
             start_time=backtest_start,
             end_time=backtest_end,
             instruments=instruments,
+            topk=getattr(ModelConfig, "TOPK", 10),
             benchmark="SH000300",
             provider_uri=provider_uri,
             price_mode="pre_adjusted",
@@ -177,6 +189,7 @@ def run_full_pipeline(
         start_time=backtest_start,
         end_time=backtest_end,
         instruments=instruments,
+        topk=getattr(ModelConfig, "TOPK", 10),
         benchmark="SH000300",
         provider_uri=provider_uri,
         signal_lag=1,
@@ -221,6 +234,7 @@ def run_multi_backtest(
                 start_time=start_time,
                 end_time=end_time,
                 instruments=instruments,
+                topk=getattr(ModelConfig, "TOPK", 10),
                 benchmark="SH000300",
                 provider_uri=provider_uri,
                 signal_lag=1,
@@ -244,6 +258,7 @@ def run_multi_backtest(
                 start_time=start_time,
                 end_time=end_time,
                 instruments=instruments,
+                topk=getattr(ModelConfig, "TOPK", 10),
                 benchmark="SH000300",
                 provider_uri=provider_uri,
                 price_mode="pre_adjusted",
@@ -265,6 +280,7 @@ def run_multi_backtest(
             start_time=start_time,
             end_time=end_time,
             instruments=instruments,
+            topk=getattr(ModelConfig, "TOPK", 10),
             benchmark="SH000300",
             provider_uri=provider_uri,
             signal_lag=1,
@@ -281,6 +297,7 @@ def run_multi_backtest(
             start_time=start_time,
             end_time=end_time,
             instruments=instruments,
+            topk=getattr(ModelConfig, "TOPK", 10),
             benchmark="SH000300",
             provider_uri=provider_uri,
             price_mode="pre_adjusted",

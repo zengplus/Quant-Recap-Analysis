@@ -77,9 +77,10 @@ class QlibDataLoader:
         # $factor 是复权因子，用于计算真实价格
         fields = ['$open', '$high', '$low', '$close', '$volume', '$factor', '$amount']
         
-        # 2. 获取股票池
+        instruments_provider = None
         if isinstance(instruments, str):
-            instruments = self._D.instruments(market=instruments)
+            instruments_provider = self._D.instruments(market=instruments)
+            instruments = instruments_provider
         
         # Resolve to list using D.list_instruments
         # This handles both config dicts (market='csi300') and symbol dicts
@@ -125,6 +126,23 @@ class QlibDataLoader:
         else:
              # Fallback if index names are messed up, but usually D.features returns MultiIndex
              self.dates = pd.to_datetime(df.index.get_level_values(0).unique()).sort_values()
+
+        bench = getattr(ModelConfig, "BENCHMARK", "SH000300")
+        bench_ret = None
+        try:
+            bench_df = self._D.features([bench], ['$close'], start_time=start_time, end_time=end_time)
+            if bench_df.index.names == ['instrument', 'datetime']:
+                bench_close = bench_df['$close'].unstack(level='datetime').iloc[0]
+            else:
+                bench_close = bench_df['$close'].unstack(level='instrument').iloc[:, 0]
+            bench_close.index = pd.to_datetime(bench_close.index)
+            bench_close = bench_close.reindex(pd.to_datetime(self.dates)).ffill().fillna(0.0)
+            bench_ret_s = (bench_close.shift(-1) / (bench_close + 1e-9)).replace([float("inf"), -float("inf")], 1.0)
+            bench_ret_s = np.log(bench_ret_s).fillna(0.0)
+            bench_ret_s.iloc[-1] = 0.0
+            bench_ret = torch.tensor(bench_ret_s.values, dtype=torch.float32, device=ModelConfig.DEVICE)
+        except Exception:
+            bench_ret = None
 
         # 4. 数据转换: DataFrame -> Tensor (Assets, Time)
         # AlphaGPT 的 FeatureEngineer 期望输入形状为 (Assets, Time) 的 Tensor
@@ -188,8 +206,46 @@ class QlibDataLoader:
             'factor': factor_safe,
             # Qlib 数据通常不包含流动性/FDV，这里用 0 填充或用成交额替代
             'liquidity': amount_t,
-            'fdv': torch.zeros_like(close_t)
+            'fdv': torch.zeros_like(close_t),
+            'bench_ret': bench_ret,
+            'asset_list': list(self.assets) if self.assets is not None else None
         }
+        pool_by_date = None
+        try:
+            if callable(instruments_provider) and self.dates is not None and self.assets is not None:
+                dt = pd.to_datetime(self.dates)
+                month_key = dt.to_period("M")
+                rebalance_dates = pd.Series(dt, index=dt).groupby(month_key).min().values
+                date_pos = {pd.Timestamp(d): i for i, d in enumerate(dt)}
+                need_dates = []
+                lag = int(getattr(ModelConfig, "SIGNAL_LAG", 1))
+                for d in pd.to_datetime(rebalance_dates):
+                    i = date_pos.get(pd.Timestamp(d))
+                    if i is None:
+                        continue
+                    prev_i = int(i) - 1 - int(lag)
+                    if prev_i < 0:
+                        continue
+                    need_dates.append(pd.Timestamp(dt[int(prev_i)]))
+                need_dates = sorted(set(need_dates))
+                pool_by_date = {}
+                for d in need_dates:
+                    ds = pd.to_datetime(d).strftime("%Y-%m-%d")
+                    pool = None
+                    try:
+                        pool = self._D.list_instruments(instruments=instruments_provider, start_time=ds, end_time=ds, as_list=True)
+                    except Exception:
+                        pool = None
+                    if pool is not None:
+                        try:
+                            pool = [str(x) for x in list(pool) if str(x).strip()]
+                        except Exception:
+                            pool = pool
+                        pool = _filter_kcbj_instruments(pool)
+                    pool_by_date[ds] = pool
+                self.raw_data_cache["pool_by_date"] = pool_by_date
+        except Exception:
+            pool_by_date = None
         
         # 6. 计算特征
         if verbose:
@@ -215,25 +271,6 @@ class QlibDataLoader:
         ret = torch.where(valid, torch.log(safe), torch.zeros_like(t1))
         self.target_ret = torch.nan_to_num(ret, nan=0.0, posinf=0.0, neginf=0.0)
         self.target_ret[:, -1:] = 0.0 # 最后一天无效
-
-        bench = getattr(ModelConfig, "BENCHMARK", "SH000300")
-        bench_ret = None
-        try:
-            bench_df = self._D.features([bench], ['$close'], start_time=start_time, end_time=end_time)
-            if bench_df.index.names == ['instrument', 'datetime']:
-                bench_close = bench_df['$close'].unstack(level='datetime').iloc[0]
-            else:
-                bench_close = bench_df['$close'].unstack(level='instrument').iloc[:, 0]
-            bench_close.index = pd.to_datetime(bench_close.index)
-            bench_close = bench_close.reindex(pd.to_datetime(self.dates)).ffill().fillna(0.0)
-            bench_ret_s = (bench_close.shift(-1) / (bench_close + 1e-9)).replace([float("inf"), -float("inf")], 1.0)
-            bench_ret_s = np.log(bench_ret_s).fillna(0.0)
-            bench_ret_s.iloc[-1] = 0.0
-            bench_ret = torch.tensor(bench_ret_s.values, dtype=torch.float32, device=ModelConfig.DEVICE)
-        except Exception:
-            bench_ret = None
-        if bench_ret is not None:
-            self.raw_data_cache["bench_ret"] = bench_ret
         
         if verbose:
             print(f"Data Ready. Feature Shape: {self.feat_tensor.shape}")

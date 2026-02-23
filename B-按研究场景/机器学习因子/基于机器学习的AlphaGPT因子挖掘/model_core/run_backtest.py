@@ -5,6 +5,7 @@ import numpy as np
 import logging
 import contextlib
 os.environ.setdefault("GYM_DISABLE_WARNINGS", "1")
+from .qlib_loader import _filter_kcbj_instruments
 
 _DEVNULL = None
 
@@ -756,6 +757,7 @@ def run_joinquant_backtest(
         if pool is not None:
             try:
                 pool = [str(x) for x in list(pool) if str(x).strip()]
+                pool = _filter_kcbj_instruments(pool)
                 pool = sorted(pool)
             except Exception:
                 pool = pool

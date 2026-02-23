@@ -28,6 +28,15 @@ def _op_jump(x: torch.Tensor) -> torch.Tensor:
 def _op_decay(x: torch.Tensor) -> torch.Tensor:
     return x + 0.8 * _ts_delay(x, 1) + 0.6 * _ts_delay(x, 2)
 
+@torch.jit.script
+def _op_tsum20(x: torch.Tensor) -> torch.Tensor:
+    w = 20
+    if x.size(1) <= 1:
+        return x
+    pad = torch.zeros((x.size(0), w - 1), device=x.device, dtype=x.dtype)
+    x_pad = torch.cat([pad, x], dim=1)
+    return x_pad.unfold(1, w, 1).sum(dim=-1)
+
 OPS_CONFIG = [
     ('ADD', lambda x, y: x + y, 2),
     ('SUB', lambda x, y: x - y, 2),
@@ -40,5 +49,6 @@ OPS_CONFIG = [
     ('JUMP', _op_jump, 1),
     ('DECAY', _op_decay, 1),
     ('DELAY1', lambda x: _ts_delay(x, 1), 1),
-    ('MAX3', lambda x: torch.max(x, torch.max(_ts_delay(x,1), _ts_delay(x,2))), 1)
+    ('MAX3', lambda x: torch.max(x, torch.max(_ts_delay(x,1), _ts_delay(x,2))), 1),
+    ('TSUM20', _op_tsum20, 1),
 ]

@@ -228,10 +228,11 @@ class AlphaGPT(nn.Module):
     def __init__(self):
         super().__init__()
         self.d_model = 64
-        self.features_list = ['RET', 'LIQ', 'PRESS', 'FOMO', 'DEV', 'VOL']
+        self.base_features_list = ['RET', 'LIQ', 'PRESS', 'FOMO', 'DEV', 'VOL']
+        self.extra_features_list = ['MOM20', 'REL_MOM20']
         self.ops_list = [cfg[0] for cfg in OPS_CONFIG]
         
-        self.vocab = self.features_list + self.ops_list
+        self.vocab = self.base_features_list + self.ops_list + self.extra_features_list
         self.vocab_size = len(self.vocab)
         
         # Embedding

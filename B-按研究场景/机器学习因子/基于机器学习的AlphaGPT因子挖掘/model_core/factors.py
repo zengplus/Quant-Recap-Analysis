@@ -193,6 +193,20 @@ class FeatureEngineer:
         fomo = MemeIndicators.fomo_acceleration(v)
         dev = MemeIndicators.pump_deviation(c)
         log_vol = torch.log1p(v)
+        c_lag20 = torch.cat([c[:, :1].repeat(1, 20), c[:, :-20]], dim=1) if c.shape[1] > 20 else c_prev
+        mom20 = torch.log(c / (c_lag20 + 1e-9))
+        bench_ret = raw_dict.get('bench_ret', None)
+        if bench_ret is None:
+            bench_ret = torch.zeros((c.shape[1],), device=c.device, dtype=c.dtype)
+        bench_ret = bench_ret.reshape(-1)
+        if bench_ret.numel() != c.shape[1]:
+            bench_ret = torch.zeros((c.shape[1],), device=c.device, dtype=c.dtype)
+        if bench_ret.numel() >= 20:
+            pad = torch.zeros((19,), device=c.device, dtype=c.dtype)
+            bench_mom20 = torch.cat([pad, bench_ret], dim=0).unfold(0, 20, 1).sum(dim=-1)
+        else:
+            bench_mom20 = torch.zeros((c.shape[1],), device=c.device, dtype=c.dtype)
+        rel_mom20 = mom20 - bench_mom20.unsqueeze(0)
         
         def robust_norm(t, window=120):
             if t.dim() != 2 or t.shape[1] < 2:
@@ -214,7 +228,9 @@ class FeatureEngineer:
             pressure,
             robust_norm(fomo),
             robust_norm(dev),
-            robust_norm(log_vol)
+            robust_norm(log_vol),
+            robust_norm(mom20),
+            robust_norm(rel_mom20)
         ], dim=1)
         
         return features
